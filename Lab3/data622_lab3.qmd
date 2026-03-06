@@ -1,0 +1,401 @@
+---
+title: "Using Classification to Build a Marketing Target Model"
+format: pdf
+editor: source
+author: Joao De Oliveira
+---
+
+
+### Overview
+
+In this lab assignment you will be exploring the _Portuguese Bank Marketing Dataset_, which consists of data on the outcomes of marketing calls to bank clients offering them a _term deposit_. A _term deposit_  is a fixed term deposit with the bank that returns the principal plus interest at the end of the pre-defined term period.
+The objective of this assignment is to apply classification models to make suggestions to the marketing team.
+
+The dataset can be found at the following link: [bank_marketing_dataset.csv](https://github.com/georgehagstrom/DATA622Spring2026/blob/main/website/assignments/labs/labData/bank_marketing_dataset.csv). This dataset is a standard benchmark for classification in the ML community,
+see the 
+[UCI Machine Learning Repository page](https://archive.ics.uci.edu/dataset/222/bank+marketing), and this introductory paper: [A data driven approach to predict the success of bank telemarketing](https://repositorio.iscte-iul.pt/bitstream/10071/9499/5/dss_v3.pdf). The specific dataset used for this assignment has some subtle differences to those available at
+the 'UCI Page'. The data is described on the course website at [bank_marketing_dictionary.qmd](labData/bank_marketing_dictionary.qmd).
+
+### Problem 1: What Can Machine Learning Do?
+
+(a) This dataset has been analyzed extensively by many different people. `kaggle.com` is a machine learning community that shares datasets, analysis methods, and hosts competitions. The most upvoted analysis notebook on `kaggle` for the Bank Marketing dataset (see: [https://www.kaggle.com/code/janiobachmann/bank-marketing-campaign-opening-a-term-deposit](https://www.kaggle.com/code/janiobachmann/bank-marketing-campaign-opening-a-term-deposit)) has a glaring flaw that makes it useless in
+practice. Examine the analysis and determine the flaw. Your answer should be short. 
+_Hint: Take a careful look at all the variables used, or look for people complaining about it in the comments._
+
+**Answer 1**
+The flaw that makes the analysis useless in practice is the fact that the call duration is being used as a predicting variable, which doesn't make sense since the call duration is only know after the call is over, meaning when we already know the output (if the client subscribed a term deposit), as noted in the dataset documentation by the author. The use of the variable might make the model look great, but it is not applicable in the real world. 
+
+
+### Problem 2: EDA and Baseline Model
+
+(a) __EDA and Temporal Patterns:__ Take a quick look at the initial distribution of the data, and perform a train-test split. Justify your choice of whether to stratify your split or not and if so by which variable (consider reading the rest of the question before deciding). Are there any additional variables that need to be added or recoded? Describe the most important relationships that you uncovered between the predictors and the target and show the visualizations you made specifically to support those conclusions. Pay particular attention to temporal variations in addition to correlation with the target: how did the success rate of the marketing campaign and the composition of the target population vary over time? Which variables (and related real world events) explain the temporal pattern?
+
+### Load Packages
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import roc_curve
+import matplotlib.pyplot as plt
+from sklearn.calibration import calibration_curve
+```
+
+### Load Data
+
+```{python}
+bank_url = "https://raw.githubusercontent.com/JDO-MSDS/DATA-622/refs/heads/main/Lab3/bank_marketing_dataset.csv"
+
+df = pd.read_csv(bank_url)
+
+df["y_bin"] = (df["y"] == "yes").astype(int)
+
+df.shape, df["y"].value_counts(normalize=True)
+```
+
+
+### Split
+
+Since the dataset is imbalanced (88% of 'no' vs 12% 'yes'), I will stratify by y in order to keep similar success rate both in train and test, otherwise there is a chance that train or test will have much less than 88% 'no', changing the balance of the dataset.
+
+```{python}
+train_df, test_df = train_test_split(
+    df,
+    test_size=0.2,
+    random_state=1234,
+    stratify=df["y_bin"]
+)
+
+train_df["y_bin"].mean(), test_df["y_bin"].mean()
+```
+
+
+### Patterns over time
+I will compute and plot the average success rate over time and the number of calls over time
+
+```{python}
+year_stats = df.groupby("year")["y_bin"].agg(success_rate = "mean", n = "size").reset_index()
+year_stats
+
+plt.figure(figsize=(7,4))
+plt.plot(year_stats["year"], year_stats["success_rate"])
+plt.xlabel("Year")
+plt.ylabel("Success rate - mean of y")
+plt.title("Client Conversion Success Rate Over Time")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(7,4))
+plt.plot(year_stats["year"], year_stats["n"])
+plt.xlabel("Year")
+plt.ylabel("Number of Calls")
+plt.title("Number of Calls Over Time")
+plt.tight_layout()
+plt.show()
+```
+
+In order to understand fluctuations within each year and possible changes of strategy, I will use a year-month time index.
+
+```{python}
+# year-month
+df["ym"] = df["year"].astype(str) + "-" + df["month_numeric"].astype(int).astype(str).str.zfill(2)
+
+ym_stats = df.groupby("ym")["y_bin"].agg(success_rate="mean", n="size").reset_index()
+ym_stats["ym_dt"] = pd.to_datetime(ym_stats["ym"] + "-01")
+
+plt.figure(figsize=(8,4))
+plt.plot(ym_stats["ym_dt"], ym_stats["success_rate"])
+plt.xlabel("Year-Month")
+plt.ylabel("Success rate")
+plt.title("Success rate over time (year-month)")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8,4))
+plt.plot(ym_stats["ym_dt"], ym_stats["n"])
+plt.xlabel("Year-Month")
+plt.ylabel("# calls")
+plt.title("Call volume over time (year-month)")
+plt.tight_layout()
+plt.show()
+```
+
+Euribor is probably a good predictor since it is a common factor to evaluate/assess the behavior of an economy, so I will plot the success rate vs euribor. I will do the same for the employment variation, which is very connected with how people behave financially. Sine success rate (between 0 and 1) has a different scales than euribor and employment rate, I will standardize the indicators to get an easier to understand plot.
+
+```{python}
+# success rate vs euribor
+macro_by_ym = df.groupby("ym")[["y_bin","euribor3m"]].mean().reset_index()
+macro_by_ym["ym_dt"] = pd.to_datetime(macro_by_ym["ym"] + "-01")
+
+tmp = macro_by_ym.copy()
+tmp[["y_bin","euribor3m"]] = StandardScaler().fit_transform(
+    tmp[["y_bin","euribor3m"]]
+)
+
+plt.figure(figsize=(8,4))
+plt.plot(tmp["ym_dt"], tmp["y_bin"], label="success rate")
+plt.plot(tmp["ym_dt"], tmp["euribor3m"], label="euribor3m")
+plt.legend()
+plt.title("Success rate vs Euribor (standardized)")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# monthly data
+macro_by_ym = df.groupby("ym")[["y_bin","emp.var.rate"]].mean().reset_index()
+macro_by_ym["ym_dt"] = pd.to_datetime(macro_by_ym["ym"] + "-01")
+
+scaled = macro_by_ym.copy()
+scaled[["y_bin","emp.var.rate"]] = StandardScaler().fit_transform(
+    scaled[["y_bin","emp.var.rate"]]
+)
+
+plt.figure(figsize=(8,4))
+plt.plot(scaled["ym_dt"], scaled["y_bin"], label="success rate (scaled)")
+plt.plot(scaled["ym_dt"], scaled["emp.var.rate"], label="employment variation (scaled)")
+plt.legend()
+plt.title("Success Rate vs Employment Variation (standardized)")
+plt.tight_layout()
+plt.show()
+```
+
+
+If a client subscribed a campaign in the past, probably becomes more likely to subscribe again. So, I will plot success rate and poutcome (success in previous campaign).
+
+```{python}
+pout_rate = df.groupby("poutcome")["y_bin"].mean().sort_values(ascending=False)
+
+plt.figure(figsize=(6,4))
+pout_rate.plot(kind="bar")
+plt.ylabel("Success rate")
+plt.title("Success rate by previous campaign outcome")
+plt.tight_layout()
+plt.show()
+```
+
+The EDA shows that both campaign performance and client behavior change substantially over time. The success rate and call volume vary across years and considerably more sharply at the monthly level, suggesting shifts in strategy and economic conditions. The sharp changes in 2009 coincide with the global financial crisis and the European debt crisis. Portugal was one of the most affected countries by the crisis, which ended up in an IMF interventation. As a portguese citizen who lived in Portugal during those times, I remember how scared and worried people were. Macroeconomic indicators such as Euribor and employment variation, which are usually great indicators of an economy "health" and behavior, move closely with the success rate, indicating that broader economic forces influence client decisions and contribute to temporal changes in the data. Also, prior campaign outcome appears to be a strong predictor of conversion, reinforcing the importance of historical interaction data when building a realistic predictive model.
+
+
+(b) __Baseline Model and Data Drift:__ The temporal variation in the dataset necessitates a careful approach to model evaluation. Explain (in one paragraph) why temporal variation in the data could cause model performance metrics evaluated on the entire testing split to mismatch the real-time experiences of the marketing team. 
+
+Since the success rate and the underlying economic conditions change over time, evaluating the model on the entire testing set at once may hide important differences in performance across different periods. If the model performs well in one economic environment but poorly in another, the overall test metric will average those results and may appear stable, even though real-world performance would fluctuate. The marketing team operates in a specific economic context at any given time, not across all periods simultaneously. So, model evaluation must consider the temporal variation to better reflect how the model would behave under changing economic conditions.
+
+
+*The standard way to approach this is to train and test your model against a 'rolling window' of observations, mimicking how the model would be used and updated in the real world. I suggest taking a simpler approach (due to dramatic changes in the amount of data in different time periods): using the variables identified as causing the temporal patterns in 2(a), divide the data into 3 to 4 _epochs_ (you could use `pd.cut` on a suitable variable). Train the model on the full training split from 2(a), but divide the test splits by the epochs and test model performance separately on the subset of the testing split corresponding to each epoch. This should tell you how the model would perform in different types of conditions.*  
+
+(c) Implement this plan by creating a baseline logistic regression model, either through 'statsmodels' or 'sklearn' (I recommend building your preprocessing steps and fitting steps into a pipeline). Select variables based on what you observed to be important in the EDA, but avoid using temporal predictors ('month_numeric', 'day', 'year') or any predictor that could not be used to make a decision on who to call. For each testing epoch, report the overall error rate and the overall success rate of the campaign during that epoch for context and comparison. For each epoch, plot the ROC curve and the probability calibration curve. What do you notice about the difference in model performance in different periods? Test the model on the entire testing set and report how the results compare to the individual epochs.
+
+
+```{python}
+df["epoch"] = df["year"].astype(str)
+df["epoch"].value_counts()
+```
+
+```{python}
+train_df, test_df = train_test_split(
+    df,
+    test_size=0.2,
+    random_state=12345,
+    stratify=df["y_bin"]
+)
+```
+
+Selecting predictors
+
+```{python}
+drop_cols = ["y", "y_bin", "duration", "year", "month_numeric", "day", "epoch", "ym"]
+
+X_train = train_df.drop(columns=drop_cols)
+y_train = train_df["y_bin"]
+
+X_test = test_df.drop(columns=drop_cols)
+y_test = test_df["y_bin"]
+
+feature_cols = X_train.columns.tolist()
+```
+
+Logistic regression pipeline
+
+```{python}
+num_cols = X_train.select_dtypes(include=["int64","float64"]).columns
+cat_cols = X_train.select_dtypes(include=["object"]).columns
+
+preprocess = ColumnTransformer([
+    ("num", StandardScaler(), num_cols),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)
+])
+
+model = Pipeline([
+    ("prep", preprocess),
+    ("logreg", LogisticRegression(max_iter=1000))
+])
+
+# train model
+model.fit(X_train, y_train)
+
+test_df["pred_prob"] = model.predict_proba(X_test)[:,1]
+```
+
+Performance by epoch
+
+```{python}
+for ep in test_df["epoch"].unique():
+
+    subset = test_df[test_df["epoch"] == ep]
+
+    X_ep = subset[feature_cols]
+    y_ep = subset["y_bin"]
+
+    probs = model.predict_proba(X_ep)[:, 1]
+    preds = model.predict(X_ep)
+
+    error_rate = 1 - accuracy_score(y_ep, preds)
+    success_rate = y_ep.mean()
+    auc = roc_auc_score(y_ep, probs)
+
+    print(ep)
+    print("Error rate:", error_rate)
+    print("Campaign success rate:", success_rate)
+    print("AUC:", auc)
+    print()
+```
+
+Calibration curves
+
+```{python}
+plt.figure(figsize=(7,5))
+
+for ep in test_df["epoch"].unique():
+
+    subset = test_df[test_df["epoch"] == ep]
+
+    X_ep = subset[feature_cols]
+    y_ep = subset["y_bin"]
+
+    probs = model.predict_proba(X_ep)[:,1]
+
+    frac_pos, mean_pred = calibration_curve(y_ep, probs, n_bins=10)
+
+    plt.plot(mean_pred, frac_pos, marker="o", label=ep)
+
+plt.plot([0,1],[0,1],"--",color="gray")
+plt.xlabel("Predicted Probability")
+plt.ylabel("Observed Probability")
+plt.title("Calibration Curve by Epoch")
+plt.legend()
+plt.show()
+```
+
+The model performance varies across the different epochs. In 2008, the campaign success rate was very low (around 5.4%), and the model achieved a relatively low AUC of about 0.60. In 2009, the success rate was higher (16.4%), and the model performance improved with an AUC around 0.76. In 2010, the campaign success rate considerably increased (around 51.3%), but the error rate also increased (from 15.8% to 31.3%) since the distribution of outcomes changed a lot. The model still has a strong AUC of about 0.74.
+
+These differences show that model performance depends a lot on the economic conditions and client behavior during each time period. The calibration curves also indicate that the model has different behavior across epochs, reinforcing the idea that a single test metric could hide important variation in performance along time. So, evaluating the model separately by epoch gives a more realistic picture of how the model would perform in practice.
+
+(d) __Lift Curves and Hit Rates:__ Your marketing team is planning a marketing campaign where they will call the top $x$ percent of likely clients based on based on model forecasts. _Lift_ describes the ratio of the success rate in the top $x$ percent to
+the success rate in the entire population and _hit rate_ means the fraction of marketing calls that are successful. A campaign that targets the top 1\% will have a much higher _lift_ than one that targets the top 50\%, and the lift of a campaign that targets everyone will be 1. A _lift curve_ is a graph showing the _lift_ on the y-axis and the percent targeted on the x-axis. Lift curves and hit rates are essential tools used to estimate the return on investment of a campaign. Estimate the lift on the testing set corresponding to each epoch by sorting the testing examples in descending order of predicted probability and then calculating the fraction of successful conversions in the top $x$ percent and dividing by the total number of successful conversions in the testing set. Make a plot of the lift curve using your baseline model for each epoch and report the lift and hit rate for campaigns that target the top 10\% and top 50\% of potential customers. 
+
+```{python}
+def calc_lift(df):
+
+    df_sorted = df.sort_values("pred_prob", ascending=False)
+
+    overall_rate = df_sorted["y_bin"].mean()
+
+    percents = np.linspace(0.01,1,100)
+    lifts = []
+
+    for p in percents:
+
+        cutoff = int(len(df_sorted)*p)
+        top = df_sorted.iloc[:cutoff]
+
+        hit_rate = top["y_bin"].mean()
+
+        lift = hit_rate / overall_rate
+        lifts.append(lift)
+
+    return percents, lifts
+```
+
+
+Plot of curves for each epoch
+
+```{python}
+plt.figure(figsize=(7,5))
+
+for ep in test_df["epoch"].unique():
+
+    subset = test_df[test_df["epoch"] == ep]
+
+    x, lift = calc_lift(subset)
+
+    plt.plot(x, lift, label=ep)
+
+plt.axhline(1, linestyle="--", color="gray")
+
+# top 10% and 50%
+plt.axvline(0.10, linestyle=":", color="black", label="10% targeting")
+plt.axvline(0.50, linestyle=":", color="darkgray", label="50% targeting")
+
+plt.xlabel("Percent of customers targeted")
+plt.ylabel("Lift")
+plt.title("Lift Curves by Epoch")
+plt.legend()
+
+plt.show()
+```
+
+
+The lift curves show that the model can identify customers who are more likely to subscribe compared to random targeting. When targeting a small percentage of customers, the lift is well above 1, meaning the success rate among the top-ranked clients is several times higher than the overall campaign success rate, which is not surprising. While we increase the percentage of targeted population, the lift gradually decreases and approaches 1, which is expected because the model begins including customers with lower predicted probabilities. The curves also show that model performance varies across epochs, with the strongest lift appearing in 2009 and lower lift in 2008 and 2010 depending on the percentage of targeted customers. 
+
+Hit rate and lift for top 10% and top 50%
+
+```{python}
+for ep in test_df["epoch"].unique():
+
+    subset = test_df[test_df["epoch"] == ep].sort_values("pred_prob", ascending=False)
+
+    overall_rate = subset["y_bin"].mean()
+
+    top10 = subset.head(int(len(subset)*0.10))
+    top50 = subset.head(int(len(subset)*0.50))
+
+    hit10 = top10["y_bin"].mean()
+    hit50 = top50["y_bin"].mean()
+
+    lift10 = hit10 / overall_rate
+    lift50 = hit50 / overall_rate
+
+    print(ep)
+    print("Top 10% hit rate:", hit10)
+    print("Top 10% lift:", lift10)
+    print("Top 50% hit rate:", hit50)
+    print("Top 50% lift:", lift50)
+    print()
+```
+
+
+The results show that targeting customers based on the model’s predicted probabilities can clearly improve the efficiency of the campaign. The top 10% of customers ranked by predicted probability, have a much higher hit rate than the overall campaign success rate in every epoch. For example, in 2009 the top 10% have a success rate of around 49% with a lift of around 3.0, meaning that the campaign is three times more effective than randomly selecting customers.
+
+When we increase the targeted group to 50% of customers, the hit rate and lift decrease. This is exactly what I expected because the model begins including clients with lower predicted probabilities of subscribing. Across epochs, 2009 shows the strongest lift, while 2008 and 2010 show smaller improvements. This shows that the targeting strategy success varies across time periods and economic conditions.
+
+
+### Extra Credit (5 pts): How Has the Marketing Team Already Been Optimizing?
+
+Understanding the data generating process is vital for modeling. This marketing dataset is not a random sample of 
+the bank's customers. Marketers may already be using a model or their own expertise to select which customers to call. This could
+lead to selection bias, where segments of the population are not represented in the dataset. As the marketing campaign progressed, 
+the marketing team may also have gained knowledge about the most effective practices, which could explain some of the temporal anomalies.
+Can you find evidence for this in any of the variables in the dataset? Note: there is a trade-off between exploration (getting data to 
+improve the model accuracy) and exploitation (making calls to optimize the number of term deposits the bank sells). This trade-off is often
+referred to as a 'multi-armed bandit' problem, see [https://en.wikipedia.org/wiki/Multi-armed_bandit](https://en.wikipedia.org/wiki/Multi-armed_bandit).
+
+**Answer Extra Credit**
+There is evidence that the marketing team was already optimizing who they contacted based on their experience. The variable `poutcome` shows that customers who previously subscribed have a much higher success rate than other groups. This probably happens because the team prioritized clients who had already shown interest in past campaigns. The variable `campaign`, which records how many times a client was contacted, also shows that the team focused more effort on clients who seemed promising. These patterns suggest that the dataset is not a random sample of customers, but a filtered group of customers based on what they learned before about which types of clients were more likely to subscribe. 
